@@ -1130,7 +1130,20 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     (void)pPresentParameters;
 
     if (dxgi_vk_swap_chain_present_is_occluded(chain))
+    {
+        /* An application using a waitable swapchain blocks on the frame
+         * latency object before every frame, and only the present callback
+         * below ever releases it. Returning here without releasing it stops
+         * such a render loop for good: the window then stops pumping
+         * messages, the window manager can no longer deliver the restore
+         * that would clear the occlusion, and the application hangs with a
+         * black window until it is killed. Keep the object ticking so the
+         * loop survives being occluded and observes the change.
+         * Releasing an already full semaphore fails harmlessly. */
+        if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
+            vkd3d_native_sync_handle_release(chain->frame_latency_event, 1);
         return DXGI_STATUS_OCCLUDED;
+    }
     if (PresentFlags & DXGI_PRESENT_TEST)
         return S_OK;
 
