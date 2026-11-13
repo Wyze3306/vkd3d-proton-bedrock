@@ -153,6 +153,8 @@ struct platform_sleep_state
 #endif
 
     uint64_t sleep_threshold_ns;
+    /* Whether the busy-wait tail also grows with the time left to wait. */
+    bool sleep_threshold_scales;
 };
 
 struct dxgi_vk_swap_chain
@@ -3648,7 +3650,9 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
      * platform's sleep function for durations longer than the threshold, which
      * is an estimated error based on the timer interval and sleep duration. */
     sleep_duration_ns = next_deadline_ns - current_time_ns;
-    sleep_threshold_ns = sleep_state->sleep_threshold_ns + sleep_duration_ns / 6;
+    sleep_threshold_ns = sleep_state->sleep_threshold_ns;
+    if (sleep_state->sleep_threshold_scales)
+        sleep_threshold_ns += sleep_duration_ns / 6;
 
     while (sleep_duration_ns > sleep_threshold_ns)
     {
@@ -3915,10 +3919,27 @@ static HRESULT dxgi_vk_swap_chain_init_sleep_state(struct platform_sleep_state *
         FIXME("NtDelayExecution not found in ntdll.\n");
 
     sleep_state->sleep_threshold_ns = (is_wine ? 1 : 4) * sleep_granularity_ns;
+    sleep_state->sleep_threshold_scales = true;
+
+    /* Wine reports a fixed 1 ms timer interval whatever the host can do, but
+     * a non-alertable NtDelayExecution is a select() with a microsecond
+     * timeout there, so it oversleeps by the host's timer slack (50 us by
+     * default on Linux) rather than by up to a timer interval. Spinning for
+     * 1 ms plus a sixth of the wait on every frame then keeps this thread
+     * busy for a quarter of a core at common frame rates, so keep the
+     * busy-wait tail short and fixed instead. */
+    if (is_wine && sleep_state->NtDelayExecution)
+    {
+        sleep_state->sleep_threshold_ns = 500000;
+        sleep_state->sleep_threshold_scales = false;
+        INFO("Using a fixed %.1lf ms busy-wait tail for the frame rate limiter.\n",
+                (double)sleep_state->sleep_threshold_ns / 1.0e6);
+    }
     return S_OK;
 #else
     /* On native builds, we use nanosleep. Assume reasonable accuracy down to 1ms. */
     sleep_state->sleep_threshold_ns = 1000000;
+    sleep_state->sleep_threshold_scales = true;
     return S_OK;
 #endif
 }
