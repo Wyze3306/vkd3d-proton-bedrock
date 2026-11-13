@@ -590,6 +590,11 @@ static inline bool is_vk_device_extension_supported(ID3D12Device *device, const 
     return false;
 }
 
+static inline bool is_vk_dgc_supported(ID3D12Device *device)
+{
+    return false;
+}
+
 static inline bool is_vkd3d_proton_device(ID3D12Device *device)
 {
     return false;
@@ -720,6 +725,13 @@ err:
         ID3D12DXVKInteropDevice_Release(dxvk_device);
     free(exts);
     return supported;
+}
+
+/* This tree keeps the NV_device_generated_commands paths, so either extension implements state templates. */
+static inline bool is_vk_dgc_supported(ID3D12Device *device)
+{
+    return is_vk_device_extension_supported(device, "VK_EXT_device_generated_commands") ||
+            is_vk_device_extension_supported(device, "VK_NV_device_generated_commands");
 }
 
 static inline bool is_vkd3d_proton_device(ID3D12Device *device)

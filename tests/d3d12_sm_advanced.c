@@ -4156,7 +4156,7 @@ void test_sm68_draw_parameters(void)
     complex_sig = NULL;
 
     if (!is_vkd3d_proton_device(context.device) ||
-        is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        is_vk_dgc_supported(context.device))
     {
         hr = ID3D12Device_CreateCommandSignature(context.device, &sig_desc, context.root_signature, &IID_ID3D12CommandSignature, (void**)&complex_sig);
         todo_if(hr == E_NOTIMPL) ok(hr == S_OK, "Failed to create command signature, hr %#x.\n", hr);

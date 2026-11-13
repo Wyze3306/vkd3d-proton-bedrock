@@ -1469,7 +1469,7 @@ void test_execute_indirect_multi_dispatch_root_descriptors(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);
@@ -1618,7 +1618,7 @@ void test_execute_indirect_multi_dispatch_root_constants(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);
@@ -1948,7 +1948,7 @@ void test_execute_indirect_state_predication(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);
@@ -2672,7 +2672,7 @@ void test_execute_indirect_state(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);
@@ -3304,7 +3304,7 @@ void test_execute_indirect_state_vbo_offsets(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);

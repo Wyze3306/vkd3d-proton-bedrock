@@ -4152,7 +4152,7 @@ void test_view_instancing_indirect_state(void)
         return;
 
     if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
+        !is_vk_dgc_supported(context.device))
     {
         skip("DGC not supported.\n");
         destroy_test_context(&context);
