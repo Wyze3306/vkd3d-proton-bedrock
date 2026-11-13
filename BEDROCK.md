@@ -48,18 +48,9 @@ D3D12 calls in menus and in a world showed that it **never calls
 `ExecuteIndirect`** on that path. It pays the raw VA cost on every draw for a
 feature it creates and then leaves unused.
 
-Measured on 2026-11-12 (RTX 4060, Minecraft 1.26.60.5, uncapped, in a world,
-gamescope headless at 1600x900), with a measurement-only build that kept push
-descriptors and dropped the state template:
-
-| root CBVs | FPS (three runs) | p99 frame time |
-|---|---|---|
-| raw VA (`force_raw_va_cbv`, what ships) | 502 / 548 / 617 | 5.5 / 5.2 / 4.4 ms |
-| push descriptors | 785 / 785 / 778 | 2.6 to 2.8 ms |
-
-That build could not ship, because an executed signature would have ignored
-its root CBV updates. This change keeps that speed and stays correct when a
-signature does run.
+A single unbracketed pair measured on 2026-11-12 suggested push descriptors
+were about 40 % faster in game. The bracketed measurement of this branch below
+does not reproduce that: the pair was noise.
 
 ## What the change does
 
@@ -118,6 +109,32 @@ On an RTX 4060 with NVIDIA 550.163.01, which exposes `VK_NV_device_generated_com
 | this branch, unset | 2226 checks, 0 failures |
 | this branch, `force_raw_va_cbv` | 2226 checks, 0 failures |
 
-The full suite and an in-game measurement of this branch have not been run
-yet; until they have, treat the speed-up above as measured on the
-measurement-only build, not on this one.
+The full d3d12 suite has not been run on this branch yet.
+
+### In game
+
+Measured on 2026-11-13: RTX 4060, Minecraft 1.26.60.5 in a local world,
+uncapped, gamescope headless at 1600x900. Each pass averages three
+10-second windows. A is the shipped native23 vkd3d-proton with
+`force_raw_va_cbv`, and B is this branch without it. Consecutive passes are
+paired, with the order reversed halfway to cancel drift.
+
+| pair | A FPS (p99) | B FPS (p99) | B vs A |
+|---|---|---|---|
+| 1 | 661 (3.0 ms) | 675 (2.7 ms) | +2.1 % |
+| 2 | 733 (2.0 ms) | 730 (2.0 ms) | -0.4 % |
+| 3 | 585 (4.7 ms) | 595 (4.0 ms) | +1.7 % |
+
+A first pair taken while a dedicated server was loading the machine (438
+against 461 FPS) is left out. Pair 3 ran on the native22 Wine, the other
+pairs on native23; within each pair, both sides ran on the same Wine.
+
+**No gain beyond the noise.** In these scenes the game is bound by its main
+thread, with the GPU about 42 % busy, so how root CBVs reach the shaders does
+not limit the frame rate. The menu does not freeze without
+`force_raw_va_cbv` (BedrockOnLinux #27), which shows that this branch builds
+Minecraft's command signatures correctly.
+
+This branch is correct and costs nothing, but in Minecraft it does not pay
+for itself today. It is worth taking only if a GPU-bound scene, such as ray
+tracing or a high render distance on a weaker GPU, shows a difference.
