@@ -1912,6 +1912,22 @@ struct d3d12_root_signature
     uint64_t root_descriptor_raw_va_mask;
     uint64_t root_descriptor_push_mask;
 
+    /* Root CBVs are read through raw VAs (push constants) rather than push descriptors. */
+    bool raw_va_cbv;
+
+    /* When root CBVs use push descriptors, a command signature that updates one cannot be
+     * implemented against this layout. Such signatures are built against a twin of this
+     * root signature whose root CBVs are raw VAs instead, created on demand from a copy of
+     * the serialized root signature. The twin is owned by this object. */
+    struct
+    {
+        void *blob;
+        size_t blob_size;
+        bool raw_payload;
+        struct d3d12_root_signature *root_signature;
+        pthread_mutex_t lock;
+    } raw_va_twin;
+
     D3D12_ROOT_SIGNATURE_FLAGS d3d12_flags;
 
     unsigned int binding_count;
@@ -1957,6 +1973,9 @@ HRESULT d3d12_root_signature_create_raw(struct d3d12_device *device, const void 
         size_t payload_size, struct d3d12_root_signature **root_signature);
 HRESULT d3d12_root_signature_create_empty(struct d3d12_device *device,
         struct d3d12_root_signature **root_signature);
+bool d3d12_root_signature_can_create_raw_va_twin(const struct d3d12_root_signature *root_signature);
+HRESULT d3d12_root_signature_get_raw_va_twin(struct d3d12_root_signature *root_signature,
+        struct d3d12_root_signature **twin);
 /* Private ref counts, for pipeline library. */
 void d3d12_root_signature_inc_ref(struct d3d12_root_signature *state);
 void d3d12_root_signature_dec_ref(struct d3d12_root_signature *state);
@@ -2290,6 +2309,17 @@ struct d3d12_pipeline_state
     bool pso_is_loaded_from_cached_blob;
     bool pso_is_fully_dynamic;
 
+    /* For pipelines whose root signature can have a raw VA twin: a private copy of the
+     * creation desc, and the same pipeline compiled against the twin, built the first
+     * time a command signature needs it. Guarded by the lock above. */
+    struct
+    {
+        struct d3d12_pipeline_state_desc *desc;
+        VkPipelineBindPoint bind_point;
+        struct d3d12_pipeline_state *state;
+        bool failed;
+    } raw_va_twin;
+
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 
@@ -2398,6 +2428,8 @@ struct vkd3d_pipeline_key
 bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
 HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state);
+HRESULT d3d12_pipeline_state_get_raw_va_twin(struct d3d12_pipeline_state *state,
+        struct d3d12_pipeline_state **twin);
 VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_state *state,
         const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
         uint32_t *dynamic_state_flags);
@@ -2718,6 +2750,9 @@ struct vkd3d_pipeline_bindings
 
     /* Needed when VK_KHR_push_descriptor is not available. */
     struct vkd3d_root_descriptor_info root_descriptors[D3D12_MAX_ROOT_COST];
+    /* The address each root descriptor was set to, whatever its form above, so that it
+     * can be re-applied after the root signature is swapped for its raw VA twin. */
+    D3D12_GPU_VIRTUAL_ADDRESS root_descriptor_vas[D3D12_MAX_ROOT_COST];
     uint64_t root_descriptor_dirty_mask;
     uint64_t root_descriptor_active_mask;
 
@@ -3815,6 +3850,11 @@ struct d3d12_command_signature
     bool requires_state_template_dgc;
     bool requires_state_template;
     enum vkd3d_pipeline_type pipeline_type;
+
+    /* Set when the state template was built against the raw VA twin of the root
+     * signature the signature was created with. ExecuteIndirect then swaps the bound
+     * root signature and pipeline for their twins around the indirect command. */
+    struct d3d12_root_signature *raw_va_twin_root_signature;
 
     struct d3d12_device *device;
 

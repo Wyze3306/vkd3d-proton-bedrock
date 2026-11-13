@@ -94,6 +94,11 @@ static void d3d12_root_signature_cleanup(struct d3d12_root_signature *root_signa
     vkd3d_free(root_signature->static_samplers_desc);
     vkd3d_free(root_signature->root_parameter_mappings);
     vkd3d_free(root_signature->root_signature_blob);
+
+    if (root_signature->raw_va_twin.root_signature)
+        ID3D12RootSignature_Release(&root_signature->raw_va_twin.root_signature->ID3D12RootSignature_iface);
+    vkd3d_free(root_signature->raw_va_twin.blob);
+    pthread_mutex_destroy(&root_signature->raw_va_twin.lock);
 }
 
 void d3d12_root_signature_inc_ref(struct d3d12_root_signature *root_signature)
@@ -478,7 +483,7 @@ static bool d3d12_root_signature_may_require_global_heap_binding(struct d3d12_de
 }
 
 static HRESULT d3d12_root_signature_info_from_desc(struct d3d12_root_signature_info *info,
-        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc)
+        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc, bool raw_va_cbv)
 {
     bool local_root_signature;
     unsigned int i, j;
@@ -523,7 +528,7 @@ static HRESULT d3d12_root_signature_info_from_desc(struct d3d12_root_signature_i
                 /* Local root signature directly affects memory layout. */
                 if (local_root_signature)
                     info->cost = (info->cost + 1u) & ~1u;
-                else if (!(device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV))
+                else if (!raw_va_cbv)
                     info->push_descriptor_count += 1;
 
                 info->binding_count += 1;
@@ -580,7 +585,7 @@ static bool d3d12_root_signature_parameter_is_raw_va(struct d3d12_root_signature
         D3D12_ROOT_PARAMETER_TYPE type)
 {
     if (type == D3D12_ROOT_PARAMETER_TYPE_CBV)
-        return !!(root_signature->device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV);
+        return root_signature->raw_va_cbv;
     else if (type == D3D12_ROOT_PARAMETER_TYPE_SRV || type == D3D12_ROOT_PARAMETER_TYPE_UAV)
         return !!(root_signature->device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV);
     else
@@ -1048,8 +1053,8 @@ static HRESULT d3d12_root_signature_init_root_descriptors(struct d3d12_root_sign
         if (!(vk_binding_info = vkd3d_malloc(sizeof(*vk_binding_info) * (info->push_descriptor_count + 1))))
             return E_OUTOFMEMORY;
     }
-    else if (!(root_signature->device->bindless_state.flags &
-            (VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV | VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV)))
+    else if (!root_signature->raw_va_cbv &&
+            !(root_signature->device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV))
     {
         return S_OK;
     }
@@ -1333,7 +1338,7 @@ static HRESULT d3d12_root_signature_init_local(struct d3d12_root_signature *root
 
     memset(&context, 0, sizeof(context));
 
-    if (FAILED(hr = d3d12_root_signature_info_from_desc(&info, device, desc)))
+    if (FAILED(hr = d3d12_root_signature_info_from_desc(&info, device, desc, root_signature->raw_va_cbv)))
         return hr;
 
 #define D3D12_MAX_SHADER_RECORD_SIZE 4096
@@ -1427,7 +1432,7 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
             | D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE))
         FIXME("Ignoring root signature flags %#x.\n", desc->Flags);
 
-    if (FAILED(hr = d3d12_root_signature_info_from_desc(&info, device, desc)))
+    if (FAILED(hr = d3d12_root_signature_info_from_desc(&info, device, desc, root_signature->raw_va_cbv)))
         return hr;
 
     if (info.cost > D3D12_MAX_ROOT_COST)
@@ -1674,11 +1679,13 @@ HRESULT d3d12_root_signature_create_work_graph_layout(struct d3d12_root_signatur
 }
 
 static HRESULT d3d12_root_signature_init(struct d3d12_root_signature *root_signature,
-        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc)
+        struct d3d12_device *device, const D3D12_ROOT_SIGNATURE_DESC2 *desc, bool raw_va_cbv)
 {
     HRESULT hr;
 
     memset(root_signature, 0, sizeof(*root_signature));
+    pthread_mutex_init(&root_signature->raw_va_twin.lock, NULL);
+    root_signature->raw_va_cbv = raw_va_cbv;
     root_signature->ID3D12RootSignature_iface.lpVtbl = &d3d12_root_signature_vtbl;
     root_signature->refcount = 1;
     root_signature->internal_refcount = 1;
@@ -1719,7 +1726,8 @@ HRESULT d3d12_root_signature_create_empty(struct d3d12_device *device,
         return E_OUTOFMEMORY;
 
     memset(&desc, 0, sizeof(desc));
-    hr = d3d12_root_signature_init(object, device, &desc);
+    hr = d3d12_root_signature_init(object, device, &desc,
+            !!(device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV));
 
     /* For pipeline libraries, (and later DXR to some degree), we need a way to
      * compare root signature objects. */
@@ -1736,8 +1744,26 @@ HRESULT d3d12_root_signature_create_empty(struct d3d12_device *device,
     return S_OK;
 }
 
-static HRESULT d3d12_root_signature_create_from_blob(struct d3d12_device *device,
-        const void *bytecode, size_t bytecode_length, bool raw_payload,
+static bool d3d12_root_signature_has_push_cbv(const struct d3d12_root_signature *root_signature)
+{
+    unsigned int i, count;
+
+    /* Hoisted descriptor table CBVs are appended as extra CBV parameters. They are push
+     * descriptors by design and never targets of a command signature, so skip them. */
+    count = root_signature->parameter_count - root_signature->hoist_info.num_desc;
+
+    for (i = 0; i < count; i++)
+    {
+        if (root_signature->parameters[i].parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                !(root_signature->root_descriptor_raw_va_mask & (1ull << i)))
+            return true;
+    }
+
+    return false;
+}
+
+static HRESULT d3d12_root_signature_create_from_blob_internal(struct d3d12_device *device,
+        const void *bytecode, size_t bytecode_length, bool raw_payload, bool raw_va_twin,
         struct d3d12_root_signature **root_signature)
 {
     const struct vkd3d_shader_code dxbc = {bytecode, bytecode_length};
@@ -1775,7 +1801,13 @@ static HRESULT d3d12_root_signature_create_from_blob(struct d3d12_device *device
         return E_OUTOFMEMORY;
     }
 
-    hr = d3d12_root_signature_init(object, device, &root_signature_desc.d3d12.Desc_1_2);
+    hr = d3d12_root_signature_init(object, device, &root_signature_desc.d3d12.Desc_1_2, raw_va_twin ||
+            !!(device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV));
+
+    /* A raw VA twin compiles to different shader interfaces than its original, so it must
+     * never share pipeline cache entries with it. */
+    if (raw_va_twin)
+        compatibility_hash = hash_fnv1_iterate_u64(compatibility_hash, 0x7261772d76612d74ull /* "raw-va-t" */);
 
     /* For pipeline libraries, (and later DXR to some degree), we need a way to
      * compare root signature objects. */
@@ -1791,6 +1823,20 @@ static HRESULT d3d12_root_signature_create_from_blob(struct d3d12_device *device
         object->root_signature_blob = vkd3d_malloc(bytecode_length);
         memcpy(object->root_signature_blob, bytecode, bytecode_length);
         object->root_signature_blob_size = bytecode_length;
+    }
+
+    /* Keep what is needed to build a raw VA twin later. Only global root signatures
+     * whose root CBVs became push descriptors can need one. */
+    if (SUCCEEDED(hr) && !raw_va_twin && !object->raw_va_cbv &&
+            !(root_signature_desc.d3d12.Desc_1_2.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) &&
+            d3d12_root_signature_has_push_cbv(object))
+    {
+        if ((object->raw_va_twin.blob = vkd3d_malloc(bytecode_length)))
+        {
+            memcpy(object->raw_va_twin.blob, bytecode, bytecode_length);
+            object->raw_va_twin.blob_size = bytecode_length;
+            object->raw_va_twin.raw_payload = raw_payload;
+        }
     }
 
     vkd3d_shader_free_root_signature(&root_signature_desc.vkd3d);
@@ -1813,14 +1859,51 @@ HRESULT d3d12_root_signature_create(struct d3d12_device *device,
         const void *bytecode, size_t bytecode_length,
         struct d3d12_root_signature **root_signature)
 {
-    return d3d12_root_signature_create_from_blob(device, bytecode, bytecode_length, false, root_signature);
+    return d3d12_root_signature_create_from_blob_internal(device, bytecode, bytecode_length,
+            false, false, root_signature);
 }
 
 HRESULT d3d12_root_signature_create_raw(struct d3d12_device *device,
         const void *payload, size_t payload_length,
         struct d3d12_root_signature **root_signature)
 {
-    return d3d12_root_signature_create_from_blob(device, payload, payload_length, true, root_signature);
+    return d3d12_root_signature_create_from_blob_internal(device, payload, payload_length,
+            true, false, root_signature);
+}
+
+bool d3d12_root_signature_can_create_raw_va_twin(const struct d3d12_root_signature *root_signature)
+{
+    return !!root_signature->raw_va_twin.blob;
+}
+
+HRESULT d3d12_root_signature_get_raw_va_twin(struct d3d12_root_signature *root_signature,
+        struct d3d12_root_signature **twin)
+{
+    struct d3d12_root_signature *object;
+    HRESULT hr = S_OK;
+
+    if (!root_signature->raw_va_twin.blob)
+        return E_NOTIMPL;
+
+    pthread_mutex_lock(&root_signature->raw_va_twin.lock);
+
+    if (!(object = root_signature->raw_va_twin.root_signature))
+    {
+        if (SUCCEEDED(hr = d3d12_root_signature_create_from_blob_internal(root_signature->device,
+                root_signature->raw_va_twin.blob, root_signature->raw_va_twin.blob_size,
+                root_signature->raw_va_twin.raw_payload, true, &object)))
+        {
+            TRACE("Created raw VA twin %p for root signature %p.\n", object, root_signature);
+            root_signature->raw_va_twin.root_signature = object;
+        }
+        else
+            ERR("Failed to create raw VA twin for root signature %p, hr %#x.\n", root_signature, hr);
+    }
+
+    pthread_mutex_unlock(&root_signature->raw_va_twin.lock);
+
+    *twin = object;
+    return hr;
 }
 
 unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_root_signature *root_signature,
@@ -2431,6 +2514,8 @@ fail:
     return NULL;
 }
 
+static void d3d12_pipeline_state_desc_free(struct d3d12_pipeline_state_desc *desc);
+
 void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
 {
     struct d3d12_device *device = state->device;
@@ -2456,6 +2541,11 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
 
         if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
             d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+
+        if (state->raw_va_twin.state)
+            ID3D12PipelineState_Release(&state->raw_va_twin.state->ID3D12PipelineState_iface);
+        d3d12_pipeline_state_desc_free(state->raw_va_twin.desc);
+
         rwlock_destroy(&state->lock);
         vkd3d_free(state);
     }
@@ -5837,6 +5927,210 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device 
     return S_OK;
 }
 
+static void d3d12_pipeline_state_desc_free(struct d3d12_pipeline_state_desc *desc)
+{
+    unsigned int i;
+
+    if (!desc)
+        return;
+
+    vkd3d_free((void *)desc->vs.pShaderBytecode);
+    vkd3d_free((void *)desc->ps.pShaderBytecode);
+    vkd3d_free((void *)desc->ds.pShaderBytecode);
+    vkd3d_free((void *)desc->hs.pShaderBytecode);
+    vkd3d_free((void *)desc->gs.pShaderBytecode);
+    vkd3d_free((void *)desc->cs.pShaderBytecode);
+    vkd3d_free((void *)desc->as.pShaderBytecode);
+    vkd3d_free((void *)desc->ms.pShaderBytecode);
+
+    if (desc->stream_output.pSODeclaration)
+    {
+        for (i = 0; i < desc->stream_output.NumEntries; i++)
+            vkd3d_free((void *)desc->stream_output.pSODeclaration[i].SemanticName);
+        vkd3d_free((void *)desc->stream_output.pSODeclaration);
+    }
+    vkd3d_free((void *)desc->stream_output.pBufferStrides);
+
+    if (desc->input_layout.pInputElementDescs)
+    {
+        for (i = 0; i < desc->input_layout.NumElements; i++)
+            vkd3d_free((void *)desc->input_layout.pInputElementDescs[i].SemanticName);
+        vkd3d_free((void *)desc->input_layout.pInputElementDescs);
+    }
+
+    vkd3d_free((void *)desc->view_instancing_desc.pViewInstanceLocations);
+    vkd3d_free(desc);
+}
+
+static bool vkd3d_dup_array(const void **dst, const void *src, size_t count, size_t size)
+{
+    void *copy;
+
+    *dst = NULL;
+    if (!src || !count)
+        return true;
+    if (!(copy = vkd3d_calloc(count, size)))
+        return false;
+    memcpy(copy, src, count * size);
+    *dst = copy;
+    return true;
+}
+
+/* A self-contained copy of a pipeline desc: every pointer the application passed is
+ * duplicated, so the desc can be compiled again long after creation returned.
+ * The root signature and any cached PSO blob are left out on purpose. */
+static struct d3d12_pipeline_state_desc *d3d12_pipeline_state_desc_dup(const struct d3d12_pipeline_state_desc *src)
+{
+    D3D12_INPUT_ELEMENT_DESC *elements;
+    D3D12_SO_DECLARATION_ENTRY *entries;
+    struct d3d12_pipeline_state_desc *dst;
+    const D3D12_SHADER_BYTECODE *src_bytecodes[] =
+    {
+        &src->vs, &src->ps, &src->ds, &src->hs, &src->gs, &src->cs, &src->as, &src->ms,
+    };
+    D3D12_SHADER_BYTECODE *dst_bytecodes[8];
+    unsigned int i;
+
+    if (!(dst = vkd3d_calloc(1, sizeof(*dst))))
+        return NULL;
+
+    *dst = *src;
+    dst->root_signature = NULL;
+    memset(&dst->cached_pso, 0, sizeof(dst->cached_pso));
+
+    dst_bytecodes[0] = &dst->vs;
+    dst_bytecodes[1] = &dst->ps;
+    dst_bytecodes[2] = &dst->ds;
+    dst_bytecodes[3] = &dst->hs;
+    dst_bytecodes[4] = &dst->gs;
+    dst_bytecodes[5] = &dst->cs;
+    dst_bytecodes[6] = &dst->as;
+    dst_bytecodes[7] = &dst->ms;
+
+    /* Clear every pointer first so a partial copy can always be freed. */
+    for (i = 0; i < ARRAY_SIZE(dst_bytecodes); i++)
+        dst_bytecodes[i]->pShaderBytecode = NULL;
+    dst->stream_output.pSODeclaration = NULL;
+    dst->stream_output.pBufferStrides = NULL;
+    dst->input_layout.pInputElementDescs = NULL;
+    dst->view_instancing_desc.pViewInstanceLocations = NULL;
+
+    for (i = 0; i < ARRAY_SIZE(dst_bytecodes); i++)
+    {
+        if (!vkd3d_dup_array(&dst_bytecodes[i]->pShaderBytecode, src_bytecodes[i]->pShaderBytecode,
+                src_bytecodes[i]->BytecodeLength, 1))
+            goto fail;
+    }
+
+    if (src->stream_output.NumEntries && src->stream_output.pSODeclaration)
+    {
+        if (!(entries = vkd3d_calloc(src->stream_output.NumEntries, sizeof(*entries))))
+            goto fail;
+        memcpy(entries, src->stream_output.pSODeclaration, src->stream_output.NumEntries * sizeof(*entries));
+        dst->stream_output.pSODeclaration = entries;
+        for (i = 0; i < src->stream_output.NumEntries; i++)
+            entries[i].SemanticName = NULL;
+        for (i = 0; i < src->stream_output.NumEntries; i++)
+        {
+            if (src->stream_output.pSODeclaration[i].SemanticName &&
+                    !(entries[i].SemanticName = vkd3d_strdup(src->stream_output.pSODeclaration[i].SemanticName)))
+                goto fail;
+        }
+    }
+    else
+        dst->stream_output.NumEntries = 0;
+
+    if (!vkd3d_dup_array((const void **)&dst->stream_output.pBufferStrides, src->stream_output.pBufferStrides,
+            src->stream_output.NumStrides, sizeof(*src->stream_output.pBufferStrides)))
+        goto fail;
+
+    if (src->input_layout.NumElements && src->input_layout.pInputElementDescs)
+    {
+        if (!(elements = vkd3d_calloc(src->input_layout.NumElements, sizeof(*elements))))
+            goto fail;
+        memcpy(elements, src->input_layout.pInputElementDescs, src->input_layout.NumElements * sizeof(*elements));
+        dst->input_layout.pInputElementDescs = elements;
+        for (i = 0; i < src->input_layout.NumElements; i++)
+            elements[i].SemanticName = NULL;
+        for (i = 0; i < src->input_layout.NumElements; i++)
+        {
+            if (src->input_layout.pInputElementDescs[i].SemanticName &&
+                    !(elements[i].SemanticName = vkd3d_strdup(src->input_layout.pInputElementDescs[i].SemanticName)))
+                goto fail;
+        }
+    }
+    else
+        dst->input_layout.NumElements = 0;
+
+    if (!vkd3d_dup_array((const void **)&dst->view_instancing_desc.pViewInstanceLocations,
+            src->view_instancing_desc.pViewInstanceLocations, src->view_instancing_desc.ViewInstanceCount,
+            sizeof(*src->view_instancing_desc.pViewInstanceLocations)))
+        goto fail;
+
+    return dst;
+
+fail:
+    d3d12_pipeline_state_desc_free(dst);
+    return NULL;
+}
+
+HRESULT d3d12_pipeline_state_get_raw_va_twin(struct d3d12_pipeline_state *state,
+        struct d3d12_pipeline_state **twin)
+{
+    struct d3d12_root_signature *twin_root_signature;
+    struct d3d12_pipeline_state_desc desc;
+    struct d3d12_pipeline_state *object;
+    HRESULT hr;
+
+    rwlock_lock_read(&state->lock);
+    object = state->raw_va_twin.state;
+    rwlock_unlock_read(&state->lock);
+
+    if (object)
+    {
+        *twin = object;
+        return S_OK;
+    }
+
+    rwlock_lock_write(&state->lock);
+
+    if ((object = state->raw_va_twin.state))
+    {
+        hr = S_OK;
+    }
+    else if (!state->raw_va_twin.desc || state->raw_va_twin.failed)
+    {
+        hr = E_NOTIMPL;
+    }
+    else if (FAILED(hr = d3d12_root_signature_get_raw_va_twin(state->root_signature, &twin_root_signature)))
+    {
+        state->raw_va_twin.failed = true;
+    }
+    else
+    {
+        desc = *state->raw_va_twin.desc;
+        desc.root_signature = &twin_root_signature->ID3D12RootSignature_iface;
+
+        /* This compiles the pipeline while a command list is being recorded,
+         * once per pipeline, and only for pipelines used with such command signatures. */
+        if (SUCCEEDED(hr = d3d12_pipeline_state_create(state->device, state->raw_va_twin.bind_point, &desc, &object)))
+        {
+            TRACE("Created raw VA twin %p for pipeline state %p.\n", object, state);
+            state->raw_va_twin.state = object;
+        }
+        else
+        {
+            ERR("Failed to create raw VA twin for pipeline state %p, hr %#x.\n", state, hr);
+            state->raw_va_twin.failed = true;
+        }
+    }
+
+    rwlock_unlock_write(&state->lock);
+
+    *twin = object;
+    return hr;
+}
+
 HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
 {
@@ -6035,6 +6329,14 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
          * so we should serialize this to internal disk cache.
          * Pushes work to disk$ thread. */
         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
+    }
+
+    /* Keep the desc in case a command signature needs this pipeline in its raw VA form. */
+    if (object->root_signature && d3d12_root_signature_can_create_raw_va_twin(object->root_signature))
+    {
+        object->raw_va_twin.bind_point = bind_point;
+        if (!(object->raw_va_twin.desc = d3d12_pipeline_state_desc_dup(desc)))
+            WARN("Failed to keep the pipeline desc, no raw VA twin can be made for %p.\n", object);
     }
 
     TRACE("Created pipeline state %p.\n", object);

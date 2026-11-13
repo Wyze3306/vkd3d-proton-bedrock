@@ -6268,7 +6268,13 @@ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d
                 *stages |= queue_shader_stages;
                 *access |= VK_ACCESS_2_UNIFORM_READ_BIT;
 
-                if (device->bindless_state.flags & (VKD3D_BINDLESS_CBV_AS_SSBO | VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV))
+                /* Root CBVs may be read through raw VAs even when the device prefers push
+                 * descriptors, by the raw VA twin of a root signature (see ExecuteIndirect). */
+                if (device->bindless_state.flags & VKD3D_BINDLESS_CBV_AS_SSBO ||
+                        device->bindless_state.flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV ||
+                        device->device_info.device_generated_commands_features_nv.deviceGeneratedCommands ||
+                        device->device_info.device_generated_commands_features_ext.deviceGeneratedCommands ||
+                        device->device_info.device_generated_commands_compute_features_nv.deviceGeneratedCompute)
                     *access |= VK_ACCESS_2_SHADER_READ_BIT;
 
                 if (vk_queue_flags & VK_QUEUE_GRAPHICS_BIT)
@@ -14029,6 +14035,8 @@ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *li
 {
     struct vkd3d_root_descriptor_info *descriptor = &bindings->root_descriptors[index];
 
+    bindings->root_descriptor_vas[index] = gpu_address;
+
     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
     else
@@ -17500,6 +17508,138 @@ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
             state ? &state->ID3D12PipelineState_iface : NULL);
 }
 
+struct vkd3d_raw_va_twin_binding
+{
+    struct vkd3d_pipeline_bindings *bindings;
+    struct d3d12_pipeline_state *state;
+    const struct d3d12_root_signature *root_signature;
+    uint64_t root_descriptor_mask;
+};
+
+/* Root descriptors are stored in the form the bound root signature wants, so after a root
+ * signature swap, set them again from their addresses. Root signatures and their twins only
+ * differ in how root CBVs are passed, so the same parameters are root descriptors in both. */
+static void d3d12_command_list_reapply_root_descriptors(struct d3d12_command_list *list,
+        struct vkd3d_pipeline_bindings *bindings, uint64_t mask)
+{
+    unsigned int index;
+
+    while (mask)
+    {
+        index = vkd3d_bitmask_iter64(&mask);
+        d3d12_command_list_set_root_descriptor(list, bindings, index, bindings->root_descriptor_vas[index]);
+    }
+}
+
+/* Root constants are stored at their push constant offset, and a raw VA twin places its
+ * root CBV addresses in front of them, so move the stored values to the new layout. */
+static void d3d12_command_list_relocate_root_constants(struct vkd3d_pipeline_bindings *bindings,
+        const struct d3d12_root_signature *from, const struct d3d12_root_signature *to)
+{
+    const struct vkd3d_shader_root_constant *src, *dst;
+    uint32_t values[ARRAY_SIZE(bindings->root_constants)];
+    uint64_t mask = from->root_constant_mask;
+    unsigned int index;
+
+    if (!mask)
+        return;
+
+    memcpy(values, bindings->root_constants, sizeof(values));
+
+    while (mask)
+    {
+        index = vkd3d_bitmask_iter64(&mask);
+        src = root_signature_get_32bit_constants(from, index);
+        dst = root_signature_get_32bit_constants(to, index);
+        assert(src->constant_count == dst->constant_count);
+        assert(dst->constant_index + dst->constant_count <= ARRAY_SIZE(values));
+        memcpy(&bindings->root_constants[dst->constant_index], &values[src->constant_index],
+                src->constant_count * sizeof(uint32_t));
+    }
+}
+
+static uint64_t d3d12_root_signature_root_descriptor_parameter_mask(const struct d3d12_root_signature *root_signature)
+{
+    unsigned int i, count;
+    uint64_t mask = 0;
+
+    /* Leave out hoisted descriptor table CBVs: they are refreshed from the descriptor heap. */
+    count = root_signature->parameter_count - root_signature->hoist_info.num_desc;
+
+    for (i = 0; i < count && i < 64; i++)
+    {
+        switch (root_signature->parameters[i].parameter_type)
+        {
+            case D3D12_ROOT_PARAMETER_TYPE_CBV:
+            case D3D12_ROOT_PARAMETER_TYPE_SRV:
+            case D3D12_ROOT_PARAMETER_TYPE_UAV:
+                mask |= 1ull << i;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    return mask;
+}
+
+static bool d3d12_command_list_bind_raw_va_twin(struct d3d12_command_list *list,
+        struct d3d12_command_signature *signature, struct vkd3d_raw_va_twin_binding *binding)
+{
+    struct vkd3d_pipeline_bindings *bindings;
+    struct d3d12_pipeline_state *twin;
+    HRESULT hr;
+
+    bindings = signature->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE ?
+            &list->compute_bindings : &list->graphics_bindings;
+
+    if (!list->state || !bindings->root_signature)
+    {
+        WARN("No pipeline or root signature bound, ignoring ExecuteIndirect.\n");
+        return false;
+    }
+
+    if (FAILED(hr = d3d12_pipeline_state_get_raw_va_twin(list->state, &twin)))
+    {
+        ERR("Pipeline state %p has no raw VA twin, hr %#x. Ignoring ExecuteIndirect which updates root CBVs.\n",
+                list->state, hr);
+        return false;
+    }
+
+    if (twin->root_signature->pso_compatibility_hash !=
+            signature->raw_va_twin_root_signature->pso_compatibility_hash)
+    {
+        ERR("Command signature %p was created for another root signature than pipeline state %p uses.\n",
+                signature, list->state);
+        return false;
+    }
+
+    binding->bindings = bindings;
+    binding->state = list->state;
+    binding->root_signature = bindings->root_signature;
+    binding->root_descriptor_mask = bindings->root_descriptor_active_mask &
+            d3d12_root_signature_root_descriptor_parameter_mask(bindings->root_signature);
+
+    d3d12_command_list_SetPipelineState(&list->ID3D12GraphicsCommandList_iface, &twin->ID3D12PipelineState_iface);
+    d3d12_command_list_set_root_signature(list, bindings, twin->root_signature);
+    d3d12_command_list_relocate_root_constants(bindings, binding->root_signature, twin->root_signature);
+    d3d12_command_list_reapply_root_descriptors(list, bindings, binding->root_descriptor_mask);
+    return true;
+}
+
+static void d3d12_command_list_unbind_raw_va_twin(struct d3d12_command_list *list,
+        const struct vkd3d_raw_va_twin_binding *binding)
+{
+    const struct d3d12_root_signature *twin = binding->bindings->root_signature;
+
+    d3d12_command_list_SetPipelineState(&list->ID3D12GraphicsCommandList_iface,
+            &binding->state->ID3D12PipelineState_iface);
+    d3d12_command_list_set_root_signature(list, binding->bindings, binding->root_signature);
+    d3d12_command_list_relocate_root_constants(binding->bindings, twin, binding->root_signature);
+    d3d12_command_list_reapply_root_descriptors(list, binding->bindings, binding->root_descriptor_mask);
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_list_iface *iface,
         ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer,
         UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset)
@@ -17544,6 +17684,13 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
 
     if (sig_impl->requires_state_template)
     {
+        struct vkd3d_raw_va_twin_binding twin_binding;
+
+        memset(&twin_binding, 0, sizeof(twin_binding));
+        if (sig_impl->raw_va_twin_root_signature &&
+                !d3d12_command_list_bind_raw_va_twin(list, sig_impl, &twin_binding))
+            return;
+
         if (sig_impl->requires_state_template_dgc)
         {
             d3d12_command_list_execute_indirect_state_template_dgc(list, sig_impl,
@@ -17558,6 +17705,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
                     arg_impl, arg_buffer_offset,
                     count_impl, count_buffer_offset);
         }
+
+        if (sig_impl->raw_va_twin_root_signature)
+            d3d12_command_list_unbind_raw_va_twin(list, &twin_binding);
 
         VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_TEMPLATE);
         return;
@@ -25243,6 +25393,9 @@ static void d3d12_command_signature_cleanup(struct d3d12_command_signature *sign
         }
     }
 
+    if (signature->raw_va_twin_root_signature)
+        d3d12_root_signature_dec_ref(signature->raw_va_twin_root_signature);
+
     d3d_destruction_notifier_free(&signature->destruction_notifier);
     vkd3d_private_store_destroy(&signature->private_store);
     vkd3d_free((void *)signature->desc.pArgumentDescs);
@@ -26281,6 +26434,27 @@ end:
     return hr;
 }
 
+static bool d3d12_command_signature_updates_push_root_descriptor(const D3D12_COMMAND_SIGNATURE_DESC *desc,
+        const struct d3d12_root_signature *root_signature)
+{
+    const D3D12_INDIRECT_ARGUMENT_DESC *argument_desc;
+    unsigned int i;
+
+    for (i = 0; i < desc->NumArgumentDescs; i++)
+    {
+        argument_desc = &desc->pArgumentDescs[i];
+
+        if ((argument_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ||
+                argument_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW ||
+                argument_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW) &&
+                !(root_signature->root_descriptor_raw_va_mask &
+                        (1ull << argument_desc->ConstantBufferView.RootParameterIndex)))
+            return true;
+    }
+
+    return false;
+}
+
 HRESULT d3d12_command_signature_create(struct d3d12_device *device, struct d3d12_root_signature *root_signature,
         const D3D12_COMMAND_SIGNATURE_DESC *desc,
         struct d3d12_command_signature **signature)
@@ -26468,6 +26642,23 @@ HRESULT d3d12_command_signature_create(struct d3d12_device *device, struct d3d12
             goto out;
         }
 
+        /* A root CBV updated by the signature must be a raw VA. If this root signature made it a push
+         * descriptor, build the template against its raw VA twin, and let ExecuteIndirect swap the
+         * twin in. Everything else keeps the faster push descriptor layout. */
+        if (root_signature && d3d12_command_signature_updates_push_root_descriptor(desc, root_signature) &&
+                d3d12_root_signature_can_create_raw_va_twin(root_signature))
+        {
+            struct d3d12_root_signature *twin;
+
+            if (SUCCEEDED(hr = d3d12_root_signature_get_raw_va_twin(root_signature, &twin)) &&
+                    !d3d12_command_signature_updates_push_root_descriptor(desc, twin))
+            {
+                d3d12_root_signature_inc_ref(object->raw_va_twin_root_signature = twin);
+                root_signature = twin;
+                TRACE("Command signature %p uses the raw VA twin %p of its root signature.\n", object, twin);
+            }
+        }
+
         if (device->device_info.device_generated_commands_features_ext.deviceGeneratedCommands)
         {
             if (FAILED(hr = d3d12_command_signature_init_state_template_dgc_ext(object, desc, root_signature, device)))
@@ -26505,6 +26696,8 @@ out:
     return S_OK;
 
 err:
+    if (object->raw_va_twin_root_signature)
+        d3d12_root_signature_dec_ref(object->raw_va_twin_root_signature);
     vkd3d_free((void *)object->desc.pArgumentDescs);
     vkd3d_free(object);
     return hr;
